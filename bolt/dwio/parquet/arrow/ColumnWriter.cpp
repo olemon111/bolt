@@ -1644,8 +1644,7 @@ inline void DoInBatchesRepeated(
     GetBufferedRows&& current_page_buffered_rows) {
   int64_t offset = 0;
   while (offset < num_levels) {
-    const int64_t max_batch_size =
-        std::min(batch_size, num_levels - offset);
+    const int64_t max_batch_size = std::min(batch_size, num_levels - offset);
     int64_t end_offset = num_levels;
     int64_t check_page_limit_end_offset = -1;
     int64_t page_buffered_rows = current_page_buffered_rows();
