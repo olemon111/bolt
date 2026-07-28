@@ -37,7 +37,6 @@
 #include <cstring>
 #include <limits>
 
-#include "bolt/common/base/BitUtil.h"
 #include "bolt/row/CompactRow.h"
 #include "bolt/row/dense/DenseRow.h"
 using namespace bytedance;
@@ -45,7 +44,6 @@ namespace bytedance::bolt::shuffle::sparksql {
 
 void ShuffleColumnarToRowConverter::init(
     const bytedance::bolt::RowTypePtr& rowType) {
-  rowType_ = rowType;
   rowTypeName_ = rowType->toString();
   if (rowFormat_ == row::RowFormat::COMPACT) {
     if (auto fixedRowSize = bolt::row::CompactRow::fixedRowSize(rowType)) {
@@ -179,11 +177,6 @@ void ShuffleColumnarToRowConverter::convert(
   BOLT_CHECK_EQ(rowVector.rowSizes_.size(), numRows);
 
   size_t cursor = 0;
-  uint64_t batchHash = 0;
-  std::vector<std::string_view> serializedRows;
-  if (VLOG_IS_ON(2)) {
-    serializedRows.reserve(numRows);
-  }
 
   for (auto i = 0; i < numRows; ++i) {
     const auto sourceRow = rowVector.rowOffset + i;
@@ -234,28 +227,6 @@ void ShuffleColumnarToRowConverter::convert(
     sortedRows[indexes[i]].push_back(bufferAddress_ + cursor);
     partitionBytes[indexes[i]] += actualRowSize + kSizeOfRowHeader;
 
-    if (VLOG_IS_ON(1)) {
-      const std::string_view serializedRow(
-          reinterpret_cast<const char*>(bufferAddress_ + bodyOffset),
-          actualRowSize);
-      if (!serializedRow.empty()) {
-        batchHash = bits::hashBytes(
-            batchHash, serializedRow.data(), serializedRow.size());
-      }
-      if (VLOG_IS_ON(2)) {
-        serializedRows.push_back(serializedRow);
-      }
-      if (VLOG_IS_ON(3)) {
-        const auto hash = serializedRow.empty()
-            ? 0
-            : bits::hashBytes(0, serializedRow.data(), serializedRow.size());
-        VLOG(3) << "[COMPACT_ROW_DEBUG] point=writer-row"
-                << " batchRow=" << i << " sourceRow=" << sourceRow
-                << " partition=" << indexes[i] << " rowSize=" << actualRowSize
-                << " rowHash=" << hash << " rowType=" << rowTypeName_;
-      }
-    }
-
     cursor += kSizeOfRowHeader + actualRowSize;
   }
 
@@ -264,29 +235,10 @@ void ShuffleColumnarToRowConverter::convert(
       static_cast<size_t>(rowVector.totalMemorySize),
       "CompactRow writer consumed a different number of bytes than allocated");
 
-  VLOG(1) << "[COMPACT_ROW_DEBUG] point=writer-batch"
-          << " sourceRowOffset=" << rowVector.rowOffset << " rows=" << numRows
-          << " bytes=" << cursor << " batchHash=" << batchHash
-          << " rowType=" << rowTypeName_;
-
-  // This deliberately decodes the just-written bytes before compression. It
-  // is the strongest writer-vs-reader discriminator, but doubles codec work,
-  // so keep it above the normal production diagnostics level.
-  if (VLOG_IS_ON(2)) {
-    try {
-      row::CompactRow::deserialize(serializedRows, rowType_, boltPool_);
-      VLOG(2) << "[COMPACT_ROW_DEBUG] point=writer-round-trip-ok"
-              << " sourceRowOffset=" << rowVector.rowOffset
-              << " rows=" << numRows << " bytes=" << cursor
-              << " batchHash=" << batchHash << " rowType=" << rowTypeName_;
-    } catch (...) {
-      LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=writer-round-trip-failed"
-                 << " sourceRowOffset=" << rowVector.rowOffset
-                 << " rows=" << numRows << " bytes=" << cursor
-                 << " batchHash=" << batchHash << " rowType=" << rowTypeName_;
-      throw;
-    }
-  }
+  LOG_FIRST_N(WARNING, 20) << "[COMPACT_ROW_DEBUG] point=writer-batch-complete"
+                           << " sourceRowOffset=" << rowVector.rowOffset
+                           << " rows=" << numRows << " bytes=" << cursor
+                           << " rowType=" << rowTypeName_;
 }
 
 void ShuffleRowToRowConverter::convert(

@@ -82,12 +82,10 @@ void logCorruptRow(
   LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=" << point << " row=" << row
              << " type=" << type->toString() << " offset=" << offset
              << " rowSize=" << serializedRow.size()
-             << " rowHash=" << rowHash(serializedRow) << " detail=" << detail;
-  if (VLOG_IS_ON(2)) {
-    LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=" << point << " rawContext="
-               << hexWindow(
-                      serializedRow, std::min(offset, serializedRow.size()));
-  }
+             << " rowHash=" << rowHash(serializedRow) << " detail=" << detail
+             << " rawContext="
+             << hexWindow(
+                    serializedRow, std::min(offset, serializedRow.size()));
 }
 
 void ensureAvailable(
@@ -1630,6 +1628,12 @@ RowVectorPtr deserializeRows(
 
   for (auto i = 0; i < numFields; ++i) {
     const auto& child = type->childAt(i);
+    const bool isArrayOfUnknown =
+        child->kind() == TypeKind::ARRAY && child->childAt(0)->isUnKnown();
+    std::vector<size_t> fieldStartOffsets;
+    if (isArrayOfUnknown) {
+      fieldStartOffsets = offsets;
+    }
     VectorPtr field;
     try {
       field = deserialize(child, data, fieldNulls[i], offsets, pool);
@@ -1640,6 +1644,66 @@ RowVectorPtr deserializeRows(
                  << " fieldType=" << child->toString()
                  << " parentType=" << type->toString();
       throw;
+    }
+    if (isArrayOfUnknown) {
+      const auto* rawFieldNulls = fieldNulls[i]->as<uint64_t>();
+      size_t affectedRows = 0;
+      size_t consumedBitmapBytes = 0;
+      for (auto row = 0; row < numRows; ++row) {
+        if (bits::isBitNull(rawFieldNulls, row)) {
+          continue;
+        }
+
+        const auto fieldStart = fieldStartOffsets[row];
+        // deserializeArrays has already validated and consumed this int32.
+        const auto arraySize = readInt32(data[row].data() + fieldStart);
+        if (arraySize == 0) {
+          continue;
+        }
+
+        ++affectedRows;
+        const auto nullBytes = bitmapBytes(arraySize);
+        consumedBitmapBytes += nullBytes;
+        const auto oldNextFieldOffset = fieldStart + kSizeBytes;
+        const auto fixedNextFieldOffset = offsets[row];
+        const auto expectedFixedOffset = oldNextFieldOffset + nullBytes;
+
+        const auto readNextInt32 = [&](size_t offset) -> std::string {
+          if (offset <= data[row].size() &&
+              kSizeBytes <= data[row].size() - offset) {
+            return std::to_string(readInt32(data[row].data() + offset));
+          }
+          return "unavailable";
+        };
+
+        LOG_FIRST_N(WARNING, 20)
+            << "[COMPACT_ROW_DEBUG] point=array-unknown-offset-fix-applied"
+            << " fieldIndex=" << i << " fieldName=" << type->asRow().nameOf(i)
+            << " nextFieldName="
+            << (i + 1 < numFields ? type->asRow().nameOf(i + 1) : "<none>")
+            << " nextFieldType="
+            << (i + 1 < numFields ? type->childAt(i + 1)->toString() : "<none>")
+            << " row=" << row << " arraySize=" << arraySize
+            << " bitmapBytes=" << nullBytes
+            << " fieldStartOffset=" << fieldStart
+            << " oldNextFieldOffset=" << oldNextFieldOffset
+            << " fixedNextFieldOffset=" << fixedNextFieldOffset
+            << " expectedFixedOffset=" << expectedFixedOffset
+            << " fixedOffsetMatchesExpected="
+            << (fixedNextFieldOffset == expectedFixedOffset)
+            << " oldOffsetNextInt32=" << readNextInt32(oldNextFieldOffset)
+            << " fixedOffsetNextInt32=" << readNextInt32(fixedNextFieldOffset)
+            << " rowSize=" << data[row].size()
+            << " rowHash=" << rowHash(data[row]);
+      }
+      if (affectedRows > 0) {
+        LOG_FIRST_N(WARNING, 20)
+            << "[COMPACT_ROW_DEBUG] point=array-unknown-offset-fix-summary"
+            << " fieldIndex=" << i << " fieldName=" << type->asRow().nameOf(i)
+            << " batchRows=" << numRows << " affectedRows=" << affectedRows
+            << " consumedBitmapBytes=" << consumedBitmapBytes
+            << " parentType=" << type->toString();
+      }
     }
     // If 'field' is fixed-width, advance offsets for rows where top-level
     // struct is not null.
@@ -1676,24 +1740,9 @@ RowVectorPtr CompactRow::deserialize(
   const auto numRows = data.size();
   std::vector<size_t> offsets(numRows, 0);
 
-  if (VLOG_IS_ON(1)) {
-    uint64_t batchHash = 0;
-    size_t totalBytes = 0;
-    for (auto row = 0; row < numRows; ++row) {
-      batchHash = data[row].empty()
-          ? batchHash
-          : bits::hashBytes(batchHash, data[row].data(), data[row].size());
-      totalBytes += data[row].size();
-      if (VLOG_IS_ON(3)) {
-        VLOG(3) << "[COMPACT_ROW_DEBUG] point=reader-row row=" << row
-                << " rowSize=" << data[row].size()
-                << " rowHash=" << rowHash(data[row]);
-      }
-    }
-    VLOG(1) << "[COMPACT_ROW_DEBUG] point=reader-batch rows=" << numRows
-            << " bytes=" << totalBytes << " batchHash=" << batchHash
-            << " rowType=" << rowType->toString();
-  }
+  LOG_FIRST_N(WARNING, 20) << "[COMPACT_ROW_DEBUG] point=reader-batch-enter"
+                           << " rows=" << numRows
+                           << " rowType=" << rowType->toString();
 
   auto result = deserializeRows(rowType, data, nullptr, offsets, pool);
   for (auto row = 0; row < numRows; ++row) {

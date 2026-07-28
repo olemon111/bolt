@@ -981,7 +981,6 @@ CompressedDiskBlockPayload::readBufferAt(uint32_t index) {
 arrow::Status RowBlockPayload::serialize(
     arrow::io::OutputStream* outputStream) {
   uint64_t headerHash = 0;
-  uint64_t payloadHash = 0;
   int64_t computedRawSize = 0;
   for (auto i = 0; i < rows_.size(); ++i) {
     RowSizeType rowSize;
@@ -997,31 +996,16 @@ arrow::Status RowBlockPayload::serialize(
           std::to_string(rowSize));
     }
 
-    if (VLOG_IS_ON(1)) {
-      headerHash = bits::hashBytes(
-          headerHash, reinterpret_cast<const char*>(rows_[i]), kRowSizeBytes);
-      computedRawSize += kRowSizeBytes + rowSize;
-    }
-
-    // Body hashing trusts the row header in exactly the same way as the codec
-    // below. Keep it at the explicit deep-diagnostics level so normal
-    // instrumentation cannot add an out-of-bounds read if a header is corrupt.
-    if (VLOG_IS_ON(3)) {
-      const auto* body =
-          reinterpret_cast<const char*>(rows_[i] + kRowSizeBytes);
-      const auto hash = rowSize == 0 ? 0 : bits::hashBytes(0, body, rowSize);
-      if (rowSize > 0) {
-        payloadHash = bits::hashBytes(payloadHash, body, rowSize);
-      }
-      VLOG(3) << "[COMPACT_ROW_DEBUG] point=payload-writer-row"
-              << " row=" << i << " rowSize=" << rowSize << " rowHash=" << hash;
-    }
+    headerHash = bits::hashBytes(
+        headerHash, reinterpret_cast<const char*>(rows_[i]), kRowSizeBytes);
+    computedRawSize += kRowSizeBytes + rowSize;
   }
-  VLOG(1) << "[COMPACT_ROW_DEBUG] point=payload-writer"
-          << " rows=" << rows_.size() << " declaredRawSize=" << rawSize_
-          << " computedRawSize=" << computedRawSize
-          << " headerHash=" << headerHash << " payloadHashV3=" << payloadHash
-          << " layout=" << static_cast<int>(layout_);
+  LOG_FIRST_N(WARNING, 20) << "[COMPACT_ROW_DEBUG] point=payload-writer"
+                           << " rows=" << rows_.size()
+                           << " declaredRawSize=" << rawSize_
+                           << " computedRawSize=" << computedRawSize
+                           << " headerHash=" << headerHash
+                           << " layout=" << static_cast<int>(layout_);
 
   RETURN_NOT_OK(
       codec_->CompressAndFlush(rows_, outputStream, rawSize_, layout_));
@@ -1073,7 +1057,6 @@ arrow::Status RowBlockPayload::deserialize(
   offset = 0;
   const auto firstOutputRow = outputRows.size();
   uint64_t outputHeaderHash = 0;
-  uint64_t outputHash = 0;
   while (remainingOutputLen >= kRowSizeBytes) {
     RowSizeType rowSize;
     std::memcpy(&rowSize, dst + offset, kRowSizeBytes);
@@ -1089,42 +1072,28 @@ arrow::Status RowBlockPayload::deserialize(
           std::to_string(rowSize));
     }
     if (rowSize <= remainingOutputLen - kRowSizeBytes) {
-      if (VLOG_IS_ON(1)) {
-        outputHeaderHash = bits::hashBytes(
-            outputHeaderHash,
-            reinterpret_cast<const char*>(dst + offset),
-            kRowSizeBytes);
-      }
+      outputHeaderHash = bits::hashBytes(
+          outputHeaderHash,
+          reinterpret_cast<const char*>(dst + offset),
+          kRowSizeBytes);
       outputRows.emplace_back(std::string_view(
           reinterpret_cast<const char*>(dst + offset + kRowSizeBytes),
           rowSize));
-      if (VLOG_IS_ON(3)) {
-        const auto hash = outputRows.back().empty()
-            ? 0
-            : bits::hashBytes(
-                  0, outputRows.back().data(), outputRows.back().size());
-        if (!outputRows.back().empty()) {
-          outputHash = bits::hashBytes(
-              outputHash, outputRows.back().data(), outputRows.back().size());
-        }
-        VLOG(3) << "[COMPACT_ROW_DEBUG] point=payload-reader-row"
-                << " outputRow=" << outputRows.size() - 1
-                << " rowSize=" << rowSize << " rowHash=" << hash;
-      }
       offset += kRowSizeBytes + rowSize;
       remainingOutputLen -= kRowSizeBytes + rowSize;
     } else {
       break;
     }
   }
-  VLOG(1) << "[COMPACT_ROW_DEBUG] point=payload-reader"
-          << " emittedRows=" << outputRows.size() - firstOutputRow
-          << " outputHeaderHash=" << outputHeaderHash
-          << " outputHashV3=" << outputHash
-          << " remainingOutputBytes=" << remainingOutputLen
-          << " consumedBytes=" << offset << " destinationBytes=" << dstSize
-          << " eof=" << eof << " layoutEnd=" << layoutEnd
-          << " layout=" << static_cast<int>(layout);
+  LOG_FIRST_N(WARNING, 20) << "[COMPACT_ROW_DEBUG] point=payload-reader"
+                           << " emittedRows="
+                           << outputRows.size() - firstOutputRow
+                           << " outputHeaderHash=" << outputHeaderHash
+                           << " remainingOutputBytes=" << remainingOutputLen
+                           << " consumedBytes=" << offset
+                           << " destinationBytes=" << dstSize << " eof=" << eof
+                           << " layoutEnd=" << layoutEnd
+                           << " layout=" << static_cast<int>(layout);
 
   return arrow::Status::OK();
 }
