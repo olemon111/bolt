@@ -36,6 +36,7 @@
 
 #include <memory>
 #include <optional>
+#include <string>
 #include <vector>
 
 #include "bolt/buffer/Buffer.h"
@@ -156,6 +157,8 @@ class ShuffleColumnarToRowConverter {
  private:
   void init(const bytedance::bolt::RowTypePtr& rowType);
   int32_t fixedRowSize_ = 0;
+  bytedance::bolt::RowTypePtr rowType_;
+  std::string rowTypeName_;
   uint8_t* bufferAddress_;
   int64_t totalBufferSize_{0};
   size_t averageRowSize_{0};

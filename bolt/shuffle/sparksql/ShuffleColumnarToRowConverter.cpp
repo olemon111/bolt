@@ -37,6 +37,7 @@
 #include <cstring>
 #include <limits>
 
+#include "bolt/common/base/BitUtil.h"
 #include "bolt/row/CompactRow.h"
 #include "bolt/row/dense/DenseRow.h"
 using namespace bytedance;
@@ -44,6 +45,8 @@ namespace bytedance::bolt::shuffle::sparksql {
 
 void ShuffleColumnarToRowConverter::init(
     const bytedance::bolt::RowTypePtr& rowType) {
+  rowType_ = rowType;
+  rowTypeName_ = rowType->toString();
   if (rowFormat_ == row::RowFormat::COMPACT) {
     if (auto fixedRowSize = bolt::row::CompactRow::fixedRowSize(rowType)) {
       fixedRowSize_ = fixedRowSize.value();
@@ -144,6 +147,7 @@ void ShuffleColumnarToRowConverter::convert(
     std::vector<std::vector<uint8_t*>>& sortedRows,
     std::vector<int64_t>& partitionBytes) {
   const auto numRows = rowVector.numRows;
+  BOLT_CHECK_GE(rowVector.totalMemorySize, 0);
   totalBufferSize_ += rowVector.totalMemorySize;
   boltBuffers_.emplace_back(
       RowInternalBuffer::allocate(rowVector.totalMemorySize, boltPool_));
@@ -171,18 +175,117 @@ void ShuffleColumnarToRowConverter::convert(
   }
 
   std::memset(bufferAddress_, 0, rowVector.totalMemorySize);
-  size_t offset = kSizeOfRowHeader;
+  BOLT_CHECK_EQ(indexes.size(), numRows);
+  BOLT_CHECK_EQ(rowVector.rowSizes_.size(), numRows);
+
+  size_t cursor = 0;
+  uint64_t batchHash = 0;
+  std::vector<std::string_view> serializedRows;
+  if (VLOG_IS_ON(2)) {
+    serializedRows.reserve(numRows);
+  }
+
   for (auto i = 0; i < numRows; ++i) {
-    auto rowSize = rowVector.compactRow->serialize(
-        rowVector.rowOffset + i,
-        reinterpret_cast<char*>(bufferAddress_ + offset));
-    BOLT_DCHECK_EQ(rowSize, rowVector.rowSizes_[i]);
-    // set rowSize
-    *(int32_t*)(bufferAddress_ + offset - kSizeOfRowHeader) = rowSize;
-    sortedRows[indexes[i]].push_back(
-        bufferAddress_ + offset - kSizeOfRowHeader);
-    partitionBytes[indexes[i]] += rowSize + kSizeOfRowHeader;
-    offset += rowSize + kSizeOfRowHeader;
+    const auto sourceRow = rowVector.rowOffset + i;
+    const auto expectedRowSize = rowVector.rowSizes_[i];
+
+    BOLT_CHECK_LE(cursor, static_cast<size_t>(rowVector.totalMemorySize));
+    const auto remainingBytes =
+        static_cast<size_t>(rowVector.totalMemorySize) - cursor;
+    BOLT_CHECK_LE(
+        kSizeOfRowHeader + expectedRowSize,
+        remainingBytes,
+        "CompactRow writer buffer is too small at source row {}: need {} "
+        "bytes, have {} (cursor {}, total {})",
+        sourceRow,
+        kSizeOfRowHeader + expectedRowSize,
+        remainingBytes,
+        cursor,
+        rowVector.totalMemorySize);
+
+    const auto bodyOffset = cursor + kSizeOfRowHeader;
+    const auto actualRowSize = rowVector.compactRow->serialize(
+        sourceRow, reinterpret_cast<char*>(bufferAddress_ + bodyOffset));
+    if (actualRowSize < 0 ||
+        static_cast<size_t>(actualRowSize) != expectedRowSize) {
+      LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=writer-size-mismatch"
+                 << " batchRow=" << i << " sourceRow=" << sourceRow
+                 << " partition=" << indexes[i]
+                 << " expectedRowSize=" << expectedRowSize
+                 << " actualRowSize=" << actualRowSize
+                 << " headerOffset=" << cursor
+                 << " allocatedBytes=" << rowVector.totalMemorySize
+                 << " rowType=" << rowTypeName_;
+    }
+    BOLT_CHECK_GE(
+        actualRowSize,
+        0,
+        "CompactRow serialization returned a negative size at source row {}",
+        sourceRow);
+    BOLT_CHECK_EQ(
+        static_cast<size_t>(actualRowSize),
+        expectedRowSize,
+        "CompactRow serialization size mismatch at source row {}",
+        sourceRow);
+
+    std::memcpy(bufferAddress_ + cursor, &actualRowSize, kSizeOfRowHeader);
+    BOLT_CHECK_LT(indexes[i], sortedRows.size());
+    BOLT_CHECK_LT(indexes[i], partitionBytes.size());
+    sortedRows[indexes[i]].push_back(bufferAddress_ + cursor);
+    partitionBytes[indexes[i]] += actualRowSize + kSizeOfRowHeader;
+
+    if (VLOG_IS_ON(1)) {
+      const std::string_view serializedRow(
+          reinterpret_cast<const char*>(bufferAddress_ + bodyOffset),
+          actualRowSize);
+      if (!serializedRow.empty()) {
+        batchHash = bits::hashBytes(
+            batchHash, serializedRow.data(), serializedRow.size());
+      }
+      if (VLOG_IS_ON(2)) {
+        serializedRows.push_back(serializedRow);
+      }
+      if (VLOG_IS_ON(3)) {
+        const auto hash = serializedRow.empty()
+            ? 0
+            : bits::hashBytes(0, serializedRow.data(), serializedRow.size());
+        VLOG(3) << "[COMPACT_ROW_DEBUG] point=writer-row"
+                << " batchRow=" << i << " sourceRow=" << sourceRow
+                << " partition=" << indexes[i] << " rowSize=" << actualRowSize
+                << " rowHash=" << hash << " rowType=" << rowTypeName_;
+      }
+    }
+
+    cursor += kSizeOfRowHeader + actualRowSize;
+  }
+
+  BOLT_CHECK_EQ(
+      cursor,
+      static_cast<size_t>(rowVector.totalMemorySize),
+      "CompactRow writer consumed a different number of bytes than allocated");
+
+  VLOG(1) << "[COMPACT_ROW_DEBUG] point=writer-batch"
+          << " sourceRowOffset=" << rowVector.rowOffset << " rows=" << numRows
+          << " bytes=" << cursor << " batchHash=" << batchHash
+          << " rowType=" << rowTypeName_;
+
+  // This deliberately decodes the just-written bytes before compression. It
+  // is the strongest writer-vs-reader discriminator, but doubles codec work,
+  // so keep it above the normal production diagnostics level.
+  if (VLOG_IS_ON(2)) {
+    try {
+      row::CompactRow::deserialize(serializedRows, rowType_, boltPool_);
+      VLOG(2) << "[COMPACT_ROW_DEBUG] point=writer-round-trip-ok"
+              << " sourceRowOffset=" << rowVector.rowOffset
+              << " rows=" << numRows << " bytes=" << cursor
+              << " batchHash=" << batchHash << " rowType=" << rowTypeName_;
+    } catch (...) {
+      LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=writer-round-trip-failed"
+                 << " sourceRowOffset=" << rowVector.rowOffset
+                 << " rows=" << numRows << " bytes=" << cursor
+                 << " batchHash=" << batchHash << " rowType=" << rowTypeName_;
+      throw;
+    }
   }
 }
 

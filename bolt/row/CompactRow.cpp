@@ -29,11 +29,99 @@
  */
 
 #include "bolt/row/CompactRow.h"
+
+#include <algorithm>
+#include <iomanip>
+#include <limits>
+#include <sstream>
+
+#include <fmt/format.h>
+
+#include "bolt/common/base/BitUtil.h"
 #include "bolt/vector/FlatVector.h"
 namespace bytedance::bolt::row {
 namespace {
 constexpr size_t kSizeBytes = sizeof(int32_t);
 using TRowSize = uint32_t;
+
+static_assert(
+    kSizeBytes == 4,
+    "CompactRow array and string lengths use a 4-byte wire encoding");
+
+std::string hexWindow(std::string_view data, size_t offset) {
+  constexpr size_t kContextBytes = 24;
+  offset = std::min(offset, data.size());
+  const auto begin = offset > kContextBytes ? offset - kContextBytes : 0;
+  const auto end = offset + std::min(kContextBytes, data.size() - offset);
+  std::ostringstream out;
+  out << "range=[" << begin << "," << end << ") bytes=";
+  for (auto i = begin; i < end; ++i) {
+    out << std::hex << std::setfill('0') << std::setw(2)
+        << static_cast<unsigned>(static_cast<unsigned char>(data[i]));
+  }
+  return out.str();
+}
+
+uint64_t rowHash(std::string_view data) {
+  return data.empty() ? 0 : bits::hashBytes(0, data.data(), data.size());
+}
+
+size_t bitmapBytes(int32_t numBits) {
+  BOLT_DCHECK_GE(numBits, 0);
+  return (static_cast<size_t>(numBits) + 7) / 8;
+}
+
+void logCorruptRow(
+    std::string_view point,
+    const TypePtr& type,
+    const std::vector<std::string_view>& data,
+    size_t row,
+    size_t offset,
+    std::string_view detail) {
+  const auto& serializedRow = data[row];
+  LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=" << point << " row=" << row
+             << " type=" << type->toString() << " offset=" << offset
+             << " rowSize=" << serializedRow.size()
+             << " rowHash=" << rowHash(serializedRow) << " detail=" << detail;
+  if (VLOG_IS_ON(2)) {
+    LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=" << point << " rawContext="
+               << hexWindow(
+                      serializedRow, std::min(offset, serializedRow.size()));
+  }
+}
+
+void ensureAvailable(
+    const TypePtr& type,
+    const std::vector<std::string_view>& data,
+    size_t row,
+    size_t offset,
+    size_t requiredBytes,
+    std::string_view point) {
+  const auto rowSize = data[row].size();
+  if (offset <= rowSize && requiredBytes <= rowSize - offset) {
+    return;
+  }
+
+  const auto remainingBytes = offset <= rowSize ? rowSize - offset : 0;
+  logCorruptRow(
+      point,
+      type,
+      data,
+      row,
+      offset,
+      fmt::format(
+          "requiredBytes={} remainingBytes={}", requiredBytes, remainingBytes));
+  BOLT_USER_FAIL(
+      "CompactRow deserialization at {} needs {} bytes at row {}, offset {}, "
+      "but only {} of {} row bytes remain. The serialized data is likely "
+      "corrupted or decoded with a different schema.",
+      point,
+      requiredBytes,
+      row,
+      offset,
+      remainingBytes,
+      rowSize);
+}
 
 void writeInt32(char* buffer, int32_t n) {
   ::memcpy(buffer, &n, kSizeBytes);
@@ -771,8 +859,18 @@ VectorPtr deserializeFixedWidth(
 
   for (auto i = 0; i < numRows; ++i) {
     const bool isNull = bits::isBitNull(rawNulls, i);
-    readFixedWidthValue<T>(
-        isNull, data[i].data() + offsets[i], flatVector.get(), i);
+    const char* valueBuffer = nullptr;
+    if (!isNull) {
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          valueSize<T>(),
+          "fixed-width-value-out-of-bounds");
+      valueBuffer = data[i].data() + offsets[i];
+    }
+    readFixedWidthValue<T>(isNull, valueBuffer, flatVector.get(), i);
   }
 
   return flatVector;
@@ -818,7 +916,16 @@ VectorPtr deserializeFixedWidthArrays(
   for (auto i = 0; i < numRows; ++i) {
     const auto size = rawSizes[i];
     if (size > 0) {
-      auto nullBytes = bits::nbytes(size);
+      const auto nullBytes = bitmapBytes(size);
+      const auto valuesBytes =
+          static_cast<size_t>(size) * static_cast<size_t>(valueBytes);
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          nullBytes + valuesBytes,
+          "fixed-width-array-payload-out-of-bounds");
 
       auto* rawElementNulls = readNulls(data[i].data() + offsets[i]);
 
@@ -879,6 +986,31 @@ VectorPtr deserializeStrings(
     if (bits::isBitNull(rawNulls, i)) {
       flatVector->setNull(i, true);
     } else {
+      ensureAvailable(
+          type, data, i, offsets[i], kSizeBytes, "string-size-out-of-bounds");
+      const auto stringSize = readInt32(data[i].data() + offsets[i]);
+      if (stringSize < 0) {
+        logCorruptRow(
+            "negative-string-size",
+            type,
+            data,
+            i,
+            offsets[i],
+            fmt::format("decodedSize={}", stringSize));
+        BOLT_USER_FAIL(
+            "CompactRow deserialization encountered a negative string size {} "
+            "at row {}, offset {}.",
+            stringSize,
+            i,
+            offsets[i]);
+      }
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          kSizeBytes + static_cast<size_t>(stringSize),
+          "string-payload-out-of-bounds");
       offsets[i] +=
           readString(data[i].data() + offsets[i], flatVector.get(), i);
     }
@@ -896,6 +1028,21 @@ VectorPtr deserializeUnknownArrays(
   const auto numRows = data.size();
   auto* rawSizes = sizes->as<vector_size_t>();
   const auto total = totalSize(rawSizes, numRows);
+
+  // UNKNOWN elements are all null, but their per-array null bitmap is still
+  // present on the wire. Skipping it makes the following field start at the
+  // wrong byte.
+  for (auto i = 0; i < numRows; ++i) {
+    const auto nullBytes = bitmapBytes(rawSizes[i]);
+    ensureAvailable(
+        type,
+        data,
+        i,
+        offsets[i],
+        nullBytes,
+        "unknown-array-nulls-out-of-bounds");
+    offsets[i] += nullBytes;
+  }
 
   return BaseVector::createNullConstant(UNKNOWN(), total, pool);
 }
@@ -924,7 +1071,14 @@ VectorPtr deserializeStringArrays(
   for (auto i = 0; i < numRows; ++i) {
     const auto size = rawSizes[i];
     if (size > 0) {
-      auto nullBytes = bits::nbytes(size);
+      const auto nullBytes = bitmapBytes(size);
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          nullBytes,
+          "string-array-nulls-out-of-bounds");
 
       auto* rawElementNulls = readNulls(data[i].data() + offsets[i]);
 
@@ -934,6 +1088,37 @@ VectorPtr deserializeStringArrays(
         if (bits::isBitSet(rawElementNulls, j)) {
           flatVector->setNull(index++, true);
         } else {
+          ensureAvailable(
+              type,
+              data,
+              i,
+              offsets[i],
+              kSizeBytes,
+              "array-string-size-out-of-bounds");
+          const auto stringSize = readInt32(data[i].data() + offsets[i]);
+          if (stringSize < 0) {
+            logCorruptRow(
+                "negative-array-string-size",
+                type,
+                data,
+                i,
+                offsets[i],
+                fmt::format("elementIndex={} decodedSize={}", j, stringSize));
+            BOLT_USER_FAIL(
+                "CompactRow deserialization encountered a negative string "
+                "size {} in array element {} at row {}, offset {}.",
+                stringSize,
+                j,
+                i,
+                offsets[i]);
+          }
+          ensureAvailable(
+              type,
+              data,
+              i,
+              offsets[i],
+              kSizeBytes + static_cast<size_t>(stringSize),
+              "array-string-payload-out-of-bounds");
           offsets[i] +=
               readString(data[i].data() + offsets[i], flatVector.get(), index);
           ++index;
@@ -982,22 +1167,136 @@ VectorPtr deserializeComplexArrays(
     const auto size = rawSizes[i];
     if (size > 0) {
       // Read nulls.
+      const auto nullBytes = bitmapBytes(size);
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          nullBytes,
+          "complex-array-nulls-out-of-bounds");
       auto* rawElementNulls = readNulls(data[i].data() + offsets[i]);
-      offsets[i] += bits::nbytes(size);
+      offsets[i] += nullBytes;
 
       // Read serialized size.
-      auto serializedSize = readInt32(data[i].data() + offsets[i]);
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          kSizeBytes,
+          "complex-array-serialized-size-out-of-bounds");
+      const auto serializedSize = readInt32(data[i].data() + offsets[i]);
+      if (serializedSize < 0) {
+        logCorruptRow(
+            "negative-complex-array-serialized-size",
+            type,
+            data,
+            i,
+            offsets[i],
+            fmt::format("decodedSize={}", serializedSize));
+        BOLT_USER_FAIL(
+            "CompactRow deserialization encountered a negative complex-array "
+            "serialized size {} at row {}, offset {}.",
+            serializedSize,
+            i,
+            offsets[i]);
+      }
       offsets[i] += kSizeBytes;
 
-      // Read offsets of individual elements.
-      auto buffer = data[i].data() + offsets[i];
+      const auto offsetTableBytes = static_cast<size_t>(size) * kSizeBytes;
+      if (offsetTableBytes >
+              static_cast<size_t>(std::numeric_limits<int32_t>::max()) ||
+          static_cast<size_t>(serializedSize) < offsetTableBytes) {
+        logCorruptRow(
+            "complex-array-offset-table-truncated",
+            type,
+            data,
+            i,
+            offsets[i] - kSizeBytes,
+            fmt::format(
+                "arraySize={} serializedSize={} offsetTableBytes={}",
+                size,
+                serializedSize,
+                offsetTableBytes));
+        BOLT_USER_FAIL(
+            "CompactRow complex-array metadata at row {} declares {} bytes, "
+            "fewer than the {} bytes required for {} element offsets.",
+            i,
+            serializedSize,
+            offsetTableBytes,
+            size);
+      }
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          static_cast<size_t>(serializedSize),
+          "complex-array-payload-out-of-bounds");
+
+      // Read and validate offsets of individual elements. Bound each nested
+      // view to the next non-null element (or the end of this array) so a
+      // corrupt child cannot silently consume bytes from a sibling or the
+      // following top-level field.
+      const auto* buffer = data[i].data() + offsets[i];
+      std::vector<int32_t> elementOffsets(size, -1);
+      std::vector<int32_t> elementEnds(size, -1);
+      int32_t previousNestedOffset = static_cast<int32_t>(offsetTableBytes);
       for (auto j = 0; j < size; ++j) {
-        if (bits::isBitSet(rawElementNulls, j)) {
+        if (!bits::isBitSet(rawElementNulls, j)) {
+          const int32_t nestedOffset = readInt32(buffer + j * kSizeBytes);
+          if (nestedOffset < static_cast<int32_t>(offsetTableBytes) ||
+              nestedOffset > serializedSize ||
+              nestedOffset < previousNestedOffset) {
+            logCorruptRow(
+                "invalid-complex-array-element-offset",
+                type,
+                data,
+                i,
+                offsets[i] + j * kSizeBytes,
+                fmt::format(
+                    "elementIndex={} nestedOffset={} previousOffset={} "
+                    "offsetTableBytes={} serializedSize={}",
+                    j,
+                    nestedOffset,
+                    previousNestedOffset,
+                    offsetTableBytes,
+                    serializedSize));
+            BOLT_USER_FAIL(
+                "CompactRow complex-array element {} at row {} has invalid "
+                "offset {} (previous {}, table bytes {}, serialized size {}).",
+                j,
+                i,
+                nestedOffset,
+                previousNestedOffset,
+                offsetTableBytes,
+                serializedSize);
+          }
+          elementOffsets[j] = nestedOffset;
+          previousNestedOffset = nestedOffset;
+        }
+      }
+
+      int32_t nextNestedOffset = serializedSize;
+      for (auto j = size; j > 0; --j) {
+        const auto elementIndex = j - 1;
+        if (elementOffsets[elementIndex] >= 0) {
+          elementEnds[elementIndex] = nextNestedOffset;
+          nextNestedOffset = elementOffsets[elementIndex];
+        }
+      }
+
+      for (auto j = 0; j < size; ++j) {
+        if (elementOffsets[j] < 0) {
           bits::setNull(rawNulls, nestedIndex);
         } else {
-          int32_t nestedOffset = readInt32(buffer + j * kSizeBytes);
-          nestedOffsets[nestedIndex] = offsets[i] + nestedOffset;
-          nestedData[nestedIndex] = data[i];
+          const auto elementOffset = static_cast<size_t>(elementOffsets[j]);
+          const auto elementSize =
+              static_cast<size_t>(elementEnds[j] - elementOffsets[j]);
+          nestedData[nestedIndex] =
+              data[i].substr(offsets[i] + elementOffset, elementSize);
+          nestedOffsets[nestedIndex] = 0;
         }
         ++nestedIndex;
       }
@@ -1006,7 +1305,31 @@ VectorPtr deserializeComplexArrays(
     }
   }
 
-  return deserialize(type, nestedData, nulls, nestedOffsets, pool);
+  auto result = deserialize(type, nestedData, nulls, nestedOffsets, pool);
+  for (auto i = 0; i < nestedData.size(); ++i) {
+    if (!bits::isBitNull(rawNulls, i) &&
+        nestedOffsets[i] != nestedData[i].size()) {
+      logCorruptRow(
+          nestedOffsets[i] > nestedData[i].size()
+              ? "complex-array-element-over-consumed"
+              : "complex-array-element-trailing-bytes",
+          type,
+          nestedData,
+          i,
+          nestedOffsets[i],
+          fmt::format(
+              "consumedBytes={} elementSize={}",
+              nestedOffsets[i],
+              nestedData[i].size()));
+      BOLT_USER_FAIL(
+          "CompactRow deserialization consumed {} of {} bytes for complex "
+          "array element {}.",
+          nestedOffsets[i],
+          nestedData[i].size(),
+          i);
+    }
+  }
+  return result;
 }
 
 // Deserializes one array from each 'row' in 'data'.
@@ -1032,21 +1355,90 @@ ArrayVectorPtr deserializeArrays(
   auto* rawArraySizes = arraySizes->asMutable<vector_size_t>();
 
   vector_size_t arrayOffset = 0;
+  const auto& elementType = type->childAt(0);
 
   for (auto i = 0; i < numRows; ++i) {
     if (!bits::isBitNull(rawNulls, i)) {
+      ensureAvailable(
+          type, data, i, offsets[i], kSizeBytes, "array-size-out-of-bounds");
+
       // Read array size.
-      int32_t size = readInt32(data[i].data() + offsets[i]);
+      // The CompactRow wire format stores cardinality as exactly four bytes.
+      // Keep 'size' int32_t; widen only the cumulative arithmetic below.
+      const int32_t size = readInt32(data[i].data() + offsets[i]);
+      if (size < 0) {
+        logCorruptRow(
+            "negative-array-size",
+            type,
+            data,
+            i,
+            offsets[i],
+            fmt::format("decodedSize32={} wireSizeBytes=4", size));
+      }
+      BOLT_USER_CHECK_GE(
+          size,
+          0,
+          "CompactRow deserialization encountered a negative 4-byte array "
+          "size {} at row {}, offset {}. The serialized data is likely "
+          "corrupted or decoded with a different schema.",
+          size,
+          i,
+          offsets[i]);
       offsets[i] += kSizeBytes;
+
+      size_t minimumPayloadBytes = bitmapBytes(size);
+      if (!elementType->isUnKnown()) {
+        if (const auto valueBytes = fixedValueSize(elementType)) {
+          minimumPayloadBytes += static_cast<size_t>(size) * valueBytes.value();
+        } else if (
+            elementType->kind() != TypeKind::VARCHAR &&
+            elementType->kind() != TypeKind::VARBINARY && size > 0) {
+          minimumPayloadBytes +=
+              kSizeBytes + static_cast<size_t>(size) * kSizeBytes;
+        }
+      }
+      ensureAvailable(
+          type,
+          data,
+          i,
+          offsets[i],
+          minimumPayloadBytes,
+          "array-minimum-payload-out-of-bounds");
+
+      const int64_t nextArrayOffset =
+          static_cast<int64_t>(arrayOffset) + static_cast<int64_t>(size);
+      if (nextArrayOffset > std::numeric_limits<vector_size_t>::max()) {
+        logCorruptRow(
+            "array-element-count-overflow",
+            type,
+            data,
+            i,
+            offsets[i] - kSizeBytes,
+            fmt::format(
+                "decodedSize32={} currentArrayOffset={} nextArrayOffset={} "
+                "wireSizeBytes=4",
+                size,
+                arrayOffset,
+                nextArrayOffset));
+      }
+      BOLT_USER_CHECK_LE(
+          nextArrayOffset,
+          std::numeric_limits<vector_size_t>::max(),
+          "CompactRow deserialization total array element count {} exceeds "
+          "the maximum supported size {} at row {}, offset {}. Each array "
+          "cardinality was decoded from a 4-byte int32.",
+          nextArrayOffset,
+          std::numeric_limits<vector_size_t>::max(),
+          i,
+          offsets[i] - kSizeBytes);
 
       rawArrayOffsets[i] = arrayOffset;
       rawArraySizes[i] = size;
-      arrayOffset += size;
+      arrayOffset = static_cast<vector_size_t>(nextArrayOffset);
     }
   }
 
   VectorPtr elements;
-  const auto& elementType = type->childAt(0);
   if (elementType->isUnKnown()) {
     elements =
         deserializeUnknownArrays(elementType, data, arraySizes, offsets, pool);
@@ -1091,12 +1483,37 @@ VectorPtr deserializeMaps(
     const BufferPtr& nulls,
     std::vector<size_t>& offsets,
     memory::MemoryPool* pool) {
+  const auto mapStartOffsets = offsets;
   auto arrayOfKeysType = ARRAY(type->childAt(0));
   auto arrayOfValuesType = ARRAY(type->childAt(1));
   auto arrayOfKeys =
       deserializeArrays(arrayOfKeysType, data, nulls, offsets, pool);
   auto arrayOfValues =
       deserializeArrays(arrayOfValuesType, data, nulls, offsets, pool);
+
+  const auto* rawNulls = nulls->as<uint64_t>();
+  for (auto row = 0; row < data.size(); ++row) {
+    if (bits::isBitNull(rawNulls, row)) {
+      continue;
+    }
+    if (arrayOfKeys->sizeAt(row) != arrayOfValues->sizeAt(row)) {
+      logCorruptRow(
+          "map-key-value-size-mismatch",
+          type,
+          data,
+          row,
+          mapStartOffsets[row],
+          fmt::format(
+              "keySize={} valueSize={}",
+              arrayOfKeys->sizeAt(row),
+              arrayOfValues->sizeAt(row)));
+      BOLT_USER_FAIL(
+          "CompactRow map at row {} has {} keys but {} values.",
+          row,
+          arrayOfKeys->sizeAt(row),
+          arrayOfValues->sizeAt(row));
+    }
+  }
 
   return std::make_shared<MapVector>(
       pool,
@@ -1166,10 +1583,25 @@ RowVectorPtr deserializeRows(
     memory::MemoryPool* pool) {
   const auto numRows = data.size();
   const size_t numFields = type->size();
+  const size_t nullLength = bits::nbytes(numFields);
 
   std::vector<VectorPtr> fields;
 
   auto* rawNulls = nulls != nullptr ? nulls->as<uint64_t>() : nullptr;
+
+  for (auto row = 0; row < numRows; ++row) {
+    const auto isTopLevelNull =
+        rawNulls != nullptr && bits::isBitNull(rawNulls, row);
+    if (!isTopLevelNull) {
+      ensureAvailable(
+          type,
+          data,
+          row,
+          offsets[row],
+          nullLength,
+          "row-null-bitmap-out-of-bounds");
+    }
+  }
 
   std::vector<BufferPtr> fieldNulls;
   fieldNulls.reserve(numFields);
@@ -1177,15 +1609,18 @@ RowVectorPtr deserializeRows(
     fieldNulls.emplace_back(allocateNulls(numRows, pool));
     auto* rawFieldNulls = fieldNulls.back()->asMutable<uint8_t>();
     for (auto row = 0; row < numRows; ++row) {
-      auto* serializedNulls = readNulls(data[row].data() + offsets[row]);
-      const auto isNull =
-          (rawNulls != nullptr && bits::isBitNull(rawNulls, row)) ||
-          bits::isBitSet(serializedNulls, i);
+      const auto isTopLevelNull =
+          rawNulls != nullptr && bits::isBitNull(rawNulls, row);
+      bool isNull = isTopLevelNull;
+      if (!isTopLevelNull) {
+        const auto* serializedNulls =
+            readNulls(data[row].data() + offsets[row]);
+        isNull = bits::isBitSet(serializedNulls, i);
+      }
       bits::setBit(rawFieldNulls, row, !isNull);
     }
   }
 
-  const size_t nullLength = bits::nbytes(numFields);
   for (auto row = 0; row < numRows; ++row) {
     if (rawNulls != nullptr && bits::isBitNull(rawNulls, row)) {
       continue;
@@ -1195,7 +1630,17 @@ RowVectorPtr deserializeRows(
 
   for (auto i = 0; i < numFields; ++i) {
     const auto& child = type->childAt(i);
-    auto field = deserialize(child, data, fieldNulls[i], offsets, pool);
+    VectorPtr field;
+    try {
+      field = deserialize(child, data, fieldNulls[i], offsets, pool);
+    } catch (...) {
+      LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=field-deserialize-failed"
+                 << " fieldIndex=" << i
+                 << " fieldName=" << type->asRow().nameOf(i)
+                 << " fieldType=" << child->toString()
+                 << " parentType=" << type->toString();
+      throw;
+    }
     // If 'field' is fixed-width, advance offsets for rows where top-level
     // struct is not null.
     if (auto numBytes = fixedValueSize(child)) {
@@ -1203,6 +1648,13 @@ RowVectorPtr deserializeRows(
         const auto isTopLevelNull =
             rawNulls != nullptr && bits::isBitNull(rawNulls, row);
         if (!isTopLevelNull) {
+          ensureAvailable(
+              child,
+              data,
+              row,
+              offsets[row],
+              numBytes.value(),
+              "fixed-width-field-slot-out-of-bounds");
           offsets[row] += numBytes.value();
         }
       }
@@ -1224,7 +1676,47 @@ RowVectorPtr CompactRow::deserialize(
   const auto numRows = data.size();
   std::vector<size_t> offsets(numRows, 0);
 
-  return deserializeRows(rowType, data, nullptr, offsets, pool);
+  if (VLOG_IS_ON(1)) {
+    uint64_t batchHash = 0;
+    size_t totalBytes = 0;
+    for (auto row = 0; row < numRows; ++row) {
+      batchHash = data[row].empty()
+          ? batchHash
+          : bits::hashBytes(batchHash, data[row].data(), data[row].size());
+      totalBytes += data[row].size();
+      if (VLOG_IS_ON(3)) {
+        VLOG(3) << "[COMPACT_ROW_DEBUG] point=reader-row row=" << row
+                << " rowSize=" << data[row].size()
+                << " rowHash=" << rowHash(data[row]);
+      }
+    }
+    VLOG(1) << "[COMPACT_ROW_DEBUG] point=reader-batch rows=" << numRows
+            << " bytes=" << totalBytes << " batchHash=" << batchHash
+            << " rowType=" << rowType->toString();
+  }
+
+  auto result = deserializeRows(rowType, data, nullptr, offsets, pool);
+  for (auto row = 0; row < numRows; ++row) {
+    if (offsets[row] != data[row].size()) {
+      logCorruptRow(
+          offsets[row] > data[row].size() ? "row-over-consumed"
+                                          : "row-trailing-bytes",
+          rowType,
+          data,
+          row,
+          offsets[row],
+          fmt::format(
+              "consumedBytes={} rowSize={}", offsets[row], data[row].size()));
+      BOLT_USER_FAIL(
+          "CompactRow deserialization consumed {} of {} bytes for row {}. "
+          "The writer and reader likely used different schemas or wire "
+          "layouts.",
+          offsets[row],
+          data[row].size(),
+          row);
+    }
+  }
+  return result;
 }
 
 } // namespace bytedance::bolt::row

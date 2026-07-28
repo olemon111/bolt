@@ -35,10 +35,12 @@
 #include <arrow/io/memory.h>
 #include <arrow/util/bitmap.h>
 #include <cstdint>
+#include <cstring>
 #include <iostream>
 #include <numeric>
 
 #include <functional>
+#include "bolt/common/base/BitUtil.h"
 #include "bolt/shuffle/sparksql/Options.h"
 #include "bolt/shuffle/sparksql/Utils.h"
 
@@ -978,6 +980,49 @@ CompressedDiskBlockPayload::readBufferAt(uint32_t index) {
 
 arrow::Status RowBlockPayload::serialize(
     arrow::io::OutputStream* outputStream) {
+  uint64_t headerHash = 0;
+  uint64_t payloadHash = 0;
+  int64_t computedRawSize = 0;
+  for (auto i = 0; i < rows_.size(); ++i) {
+    RowSizeType rowSize;
+    std::memcpy(&rowSize, rows_[i], kRowSizeBytes);
+    if (rowSize < 0) {
+      LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=payload-negative-row-size"
+                 << " row=" << i << " rowSize=" << rowSize
+                 << " payloadRows=" << rows_.size()
+                 << " declaredRawSize=" << rawSize_
+                 << " layout=" << static_cast<int>(layout_);
+      return arrow::Status::Invalid(
+          "Negative CompactRow size before shuffle compression: ",
+          std::to_string(rowSize));
+    }
+
+    if (VLOG_IS_ON(1)) {
+      headerHash = bits::hashBytes(
+          headerHash, reinterpret_cast<const char*>(rows_[i]), kRowSizeBytes);
+      computedRawSize += kRowSizeBytes + rowSize;
+    }
+
+    // Body hashing trusts the row header in exactly the same way as the codec
+    // below. Keep it at the explicit deep-diagnostics level so normal
+    // instrumentation cannot add an out-of-bounds read if a header is corrupt.
+    if (VLOG_IS_ON(3)) {
+      const auto* body =
+          reinterpret_cast<const char*>(rows_[i] + kRowSizeBytes);
+      const auto hash = rowSize == 0 ? 0 : bits::hashBytes(0, body, rowSize);
+      if (rowSize > 0) {
+        payloadHash = bits::hashBytes(payloadHash, body, rowSize);
+      }
+      VLOG(3) << "[COMPACT_ROW_DEBUG] point=payload-writer-row"
+              << " row=" << i << " rowSize=" << rowSize << " rowHash=" << hash;
+    }
+  }
+  VLOG(1) << "[COMPACT_ROW_DEBUG] point=payload-writer"
+          << " rows=" << rows_.size() << " declaredRawSize=" << rawSize_
+          << " computedRawSize=" << computedRawSize
+          << " headerHash=" << headerHash << " payloadHashV3=" << payloadHash
+          << " layout=" << static_cast<int>(layout_);
+
   RETURN_NOT_OK(
       codec_->CompressAndFlush(rows_, outputStream, rawSize_, layout_));
   return arrow::Status::OK();
@@ -1009,20 +1054,77 @@ arrow::Status RowBlockPayload::deserialize(
   }
   // total decompressed size is previous partial rowsize + current decompressed
   // size
-  remainingOutputLen += offset;
+  const int64_t totalOutputLen =
+      static_cast<int64_t>(remainingOutputLen) + offset;
+  if (offset < 0 || remainingOutputLen < 0 || totalOutputLen > dstSize) {
+    LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=invalid-decompressed-size"
+               << " previousPartialBytes=" << offset
+               << " decompressedBytes=" << remainingOutputLen
+               << " totalOutputBytes=" << totalOutputLen
+               << " destinationBytes=" << dstSize << " eof=" << eof
+               << " layoutEnd=" << layoutEnd;
+    return arrow::Status::Invalid(
+        "Invalid decompressed CompactRow byte count: ",
+        std::to_string(totalOutputLen),
+        " for destination size ",
+        std::to_string(dstSize));
+  }
+  remainingOutputLen = static_cast<int32_t>(totalOutputLen);
   offset = 0;
+  const auto firstOutputRow = outputRows.size();
+  uint64_t outputHeaderHash = 0;
+  uint64_t outputHash = 0;
   while (remainingOutputLen >= kRowSizeBytes) {
-    auto rowSize = *(RowSizeType*)(dst + offset);
-    if (remainingOutputLen >= kRowSizeBytes + rowSize) {
+    RowSizeType rowSize;
+    std::memcpy(&rowSize, dst + offset, kRowSizeBytes);
+    if (rowSize < 0) {
+      LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=reader-negative-row-size"
+                 << " bufferOffset=" << offset << " rowSize=" << rowSize
+                 << " remainingOutputBytes=" << remainingOutputLen
+                 << " destinationBytes=" << dstSize << " eof=" << eof
+                 << " layoutEnd=" << layoutEnd
+                 << " layout=" << static_cast<int>(layout);
+      return arrow::Status::Invalid(
+          "Negative CompactRow size after shuffle decompression: ",
+          std::to_string(rowSize));
+    }
+    if (rowSize <= remainingOutputLen - kRowSizeBytes) {
+      if (VLOG_IS_ON(1)) {
+        outputHeaderHash = bits::hashBytes(
+            outputHeaderHash,
+            reinterpret_cast<const char*>(dst + offset),
+            kRowSizeBytes);
+      }
       outputRows.emplace_back(std::string_view(
           reinterpret_cast<const char*>(dst + offset + kRowSizeBytes),
           rowSize));
+      if (VLOG_IS_ON(3)) {
+        const auto hash = outputRows.back().empty()
+            ? 0
+            : bits::hashBytes(
+                  0, outputRows.back().data(), outputRows.back().size());
+        if (!outputRows.back().empty()) {
+          outputHash = bits::hashBytes(
+              outputHash, outputRows.back().data(), outputRows.back().size());
+        }
+        VLOG(3) << "[COMPACT_ROW_DEBUG] point=payload-reader-row"
+                << " outputRow=" << outputRows.size() - 1
+                << " rowSize=" << rowSize << " rowHash=" << hash;
+      }
       offset += kRowSizeBytes + rowSize;
       remainingOutputLen -= kRowSizeBytes + rowSize;
     } else {
       break;
     }
   }
+  VLOG(1) << "[COMPACT_ROW_DEBUG] point=payload-reader"
+          << " emittedRows=" << outputRows.size() - firstOutputRow
+          << " outputHeaderHash=" << outputHeaderHash
+          << " outputHashV3=" << outputHash
+          << " remainingOutputBytes=" << remainingOutputLen
+          << " consumedBytes=" << offset << " destinationBytes=" << dstSize
+          << " eof=" << eof << " layoutEnd=" << layoutEnd
+          << " layout=" << static_cast<int>(layout);
 
   return arrow::Status::OK();
 }

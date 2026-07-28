@@ -28,6 +28,8 @@
  * --------------------------------------------------------------------------
  */
 
+#include <array>
+
 #include <gtest/gtest.h>
 
 #include "bolt/row/CompactRow.h"
@@ -369,6 +371,57 @@ TEST_F(CompactRowTest, unknown) {
   });
 
   testRoundTrip(data);
+}
+
+TEST_F(CompactRowTest, arrayOfUnknownFollowedByFields) {
+  auto data = makeRowVector({
+      makeArrayVector({0, 1, 3, 3}, makeAllNullFlatVector<UnknownValue>(4)),
+      makeArrayVector<int64_t>({{10}, {20, 30}, {}, {40}}),
+      makeFlatVector<std::string>({"a", "bb", "ccc", "dddd"}),
+  });
+
+  testRoundTrip(data);
+}
+
+TEST_F(CompactRowTest, arrayCardinalityUsesFourBytes) {
+  // The first eight bytes at the array-size position are
+  // 01 00 00 00 00 00 60 fd. Reading the 4-byte cardinality as int64_t would
+  // produce the negative value seen in the production error log instead of 1.
+  std::array<char, 14> serializedRow{};
+  serializedRow[1] = 1;
+  serializedRow[7] = static_cast<char>(0x60);
+  serializedRow[8] = static_cast<char>(0xfd);
+
+  std::vector<std::string_view> rows{
+      std::string_view(serializedRow.data(), serializedRow.size())};
+  auto result = CompactRow::deserialize(rows, ROW({ARRAY(BIGINT())}), pool());
+
+  auto* array = result->childAt(0)->as<ArrayVector>();
+  ASSERT_EQ(array->sizeAt(0), 1);
+  EXPECT_EQ(
+      array->elements()->as<FlatVector<int64_t>>()->valueAt(0), 0x00fd6000);
+}
+
+TEST_F(CompactRowTest, rejectsMalformedArraySize) {
+  const auto rowType = ROW({ARRAY(BIGINT())});
+
+  const std::array<char, 5> negativeSize{
+      0,
+      static_cast<char>(0xff),
+      static_cast<char>(0xff),
+      static_cast<char>(0xff),
+      static_cast<char>(0xff)};
+  std::vector<std::string_view> rows{
+      std::string_view(negativeSize.data(), negativeSize.size())};
+  EXPECT_THROW(CompactRow::deserialize(rows, rowType, pool()), BoltUserError);
+
+  const std::array<char, 1> truncated{0};
+  rows = {std::string_view(truncated.data(), truncated.size())};
+  EXPECT_THROW(CompactRow::deserialize(rows, rowType, pool()), BoltUserError);
+
+  const std::array<char, 5> missingPayload{0, 1, 0, 0, 0};
+  rows = {std::string_view(missingPayload.data(), missingPayload.size())};
+  EXPECT_THROW(CompactRow::deserialize(rows, rowType, pool()), BoltUserError);
 }
 
 TEST_F(CompactRowTest, mix) {

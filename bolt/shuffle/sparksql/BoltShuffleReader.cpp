@@ -49,7 +49,9 @@
 #include "bolt/vector/arrow/Bridge.h"
 
 #include <cstdint>
+#include <cstring>
 #include <iostream>
+#include <limits>
 
 // using namespace facebook;
 using namespace bytedance::bolt;
@@ -626,7 +628,23 @@ RowVectorPtr BoltColumnarBatchDeserializer::nextFromRows() {
     constexpr int32_t kRowSizeBytes = sizeof(int32_t);
     int32_t atLeastOneRowSize = 0;
     if (partialRow_ && partialRowSize_ >= kRowSizeBytes) {
-      atLeastOneRowSize = *(int32_t*)(partialRow_) + kRowSizeBytes;
+      int32_t partialRowBodySize;
+      std::memcpy(&partialRowBodySize, partialRow_, kRowSizeBytes);
+      if (partialRowBodySize < 0 ||
+          partialRowBodySize >
+              std::numeric_limits<int32_t>::max() - kRowSizeBytes) {
+        LOG(ERROR) << "[COMPACT_ROW_DEBUG] point=invalid-partial-row-header"
+                   << " rowSize=" << partialRowBodySize
+                   << " partialBytes=" << partialRowSize_
+                   << " batchRows=" << batchSize_
+                   << " shuffleBatchBytes=" << shuffleBatchByteSize_;
+        BOLT_USER_FAIL(
+            "Invalid CompactRow shuffle row size {} in a partial row with {} "
+            "available bytes.",
+            partialRowBodySize,
+            partialRowSize_);
+      }
+      atLeastOneRowSize = partialRowBodySize + kRowSizeBytes;
     }
     rowBufferPool_->getRowBuffer(&dst, dstSize, atLeastOneRowSize);
     // copy previous row fragment
