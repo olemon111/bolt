@@ -29,6 +29,7 @@ add_executable(
   bolt_serializer_test
   PrestoOutputStreamListenerTest.cpp
   PrestoSerializerTest.cpp
+  SpillSerializerTest.cpp
   UnsafeRowSerializerTest.cpp
   CompactRowSerializerTest.cpp
   ArrowSerializerTest.cpp

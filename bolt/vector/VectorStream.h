@@ -162,6 +162,7 @@ class VectorSerde {
     kCompactRow,
     kUnsafeRow,
     kArrow,
+    kSpill,
   };
 
   static std::string kindName(Kind type);

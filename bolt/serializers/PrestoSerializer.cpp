@@ -30,6 +30,8 @@
 
 #include "bolt/serializers/PrestoSerializer.h"
 #include <folly/compression/Zstd.h>
+#include <array>
+#include "bolt/serializers/PrestoSerializerInternal.h"
 
 #include <limits>
 #include "bolt/common/base/Crc.h"
@@ -1482,6 +1484,59 @@ class VectorStream {
     return nulls_;
   }
 
+  // Spill widens only page lengths. Leaf buffers and offsets still use the
+  // existing column representation and int32 read APIs. Composite streams
+  // may exceed this limit in total, provided each constituent buffer fits.
+  void validateForSpill() const {
+    constexpr auto limit = std::numeric_limits<int32_t>::max();
+    BOLT_CHECK_GE(nonNullCount_, 0);
+    BOLT_CHECK_GE(nullCount_, 0);
+    BOLT_CHECK_GE(totalLength_, 0);
+    BOLT_CHECK_LE(int64_t{nonNullCount_} + nullCount_, limit);
+    BOLT_CHECK_LE(values_.size(), limit, "Spill leaf values exceed INT32_MAX");
+    BOLT_CHECK_LE(lengths_.size(), limit, "Spill offsets exceed INT32_MAX");
+    BOLT_CHECK_LE(nulls_.size(), limit, "Spill null count exceeds INT32_MAX");
+    for (const auto& child : children_) {
+      child->validateForSpill();
+    }
+  }
+
+  // Size queries must not flush bit streams: flushing reverses their null
+  // bitmap in place, while a spill writer may append more rows afterwards.
+  size_t spillSerializedSize() const {
+    validateForSpill();
+    size_t size = header_.size + sizeof(int32_t);
+    if (isConstantStream_) {
+      return size + children_[0]->spillSerializedSize();
+    }
+    if (isDictionaryStream_) {
+      return size + children_[0]->spillSerializedSize() + values_.size() + 24;
+    }
+    size += values_.size() + lengths_.size() + 1;
+    if (nullCount_) {
+      size += bits::nbytes(nulls_.size());
+    }
+    for (const auto& child : children_) {
+      size += child->spillSerializedSize();
+    }
+    switch (type_->kind()) {
+      case TypeKind::ROW:
+      case TypeKind::VARIANT:
+        if (!isTimestampWithTimeZoneType(type_)) {
+          size += sizeof(int32_t); // Child count.
+        }
+        break;
+      case TypeKind::MAP:
+      case TypeKind::VARCHAR:
+      case TypeKind::VARBINARY:
+        size += sizeof(int32_t); // Hash table size or value byte count.
+        break;
+      default:
+        break;
+    }
+    return size;
+  }
+
   // Returns the size to flush to OutputStream before calling `flush`.
   size_t serializedSize() {
     CountingOutputStream out;
@@ -2376,7 +2431,17 @@ void serializeFlatVector(
   appendNonNull(stream, nulls, rows, rawValues, scratch);
 }
 
-uint64_t bitsToBytesMap[256];
+// Boolean expansion must also work when spill is used without registering
+// the standard Presto serde. The table is immutable after initialization.
+constexpr auto bitsToBytesMap = [] {
+  std::array<uint64_t, 256> table{};
+  for (uint32_t value = 0; value < table.size(); ++value) {
+    for (uint32_t bit = 0; bit < 8; ++bit) {
+      table[value] |= static_cast<uint64_t>((value >> bit) & 1) << (bit * 8);
+    }
+  }
+  return table;
+}();
 
 uint64_t bitsToBytes(uint8_t byte) {
   return bitsToBytesMap[byte];
@@ -3513,7 +3578,7 @@ class PrestoBatchVectorSerializer : public BatchVectorSerializer {
   const std::unique_ptr<folly::io::Codec> codec_;
 };
 
-class PrestoVectorSerializer : public VectorSerializer {
+class PrestoVectorSerializer : public detail::ColumnSerializer {
  public:
   PrestoVectorSerializer(
       const RowTypePtr& rowType,
@@ -3604,6 +3669,30 @@ class PrestoVectorSerializer : public VectorSerializer {
     }
   }
 
+  int32_t numRows() const override {
+    return numRows_;
+  }
+
+  size_t columnsSize() const override {
+    size_t size = sizeof(int32_t);
+    for (const auto& stream : streams_) {
+      size += stream->spillSerializedSize();
+    }
+    return size;
+  }
+
+  void flushColumns(OutputStream* out) override {
+    // Validate all buffers before writing any payload. Standard Presto flush
+    // continues to use its original framing and validation path below.
+    for (const auto& stream : streams_) {
+      stream->validateForSpill();
+    }
+    writeInt32(out, streams_.size());
+    for (const auto& stream : streams_) {
+      stream->flush(out);
+    }
+  }
+
   size_t maxSerializedSize() const override {
     size_t dataSize = 4; // streams_.size()
     for (auto& stream : streams_) {
@@ -3648,6 +3737,62 @@ class PrestoVectorSerializer : public VectorSerializer {
   std::vector<std::unique_ptr<VectorStream>> streams_;
 };
 } // namespace
+
+std::unique_ptr<detail::ColumnSerializer> detail::createColumnSerializer(
+    const RowTypePtr& type,
+    int32_t numRows,
+    StreamArena* arena,
+    bool useLosslessTimestamp) {
+  return std::make_unique<PrestoVectorSerializer>(
+      type,
+      std::vector<VectorEncoding::Simple>{},
+      numRows,
+      arena,
+      useLosslessTimestamp,
+      common::CompressionKind_NONE);
+}
+
+void detail::deserializeColumns(
+    ByteInputStream* source,
+    memory::MemoryPool* pool,
+    const RowTypePtr& type,
+    RowVectorPtr* result,
+    int32_t numRows,
+    vector_size_t resultOffset,
+    bool useLosslessTimestamp) {
+  BOLT_CHECK_GE(numRows, 0);
+  BOLT_CHECK_GE(resultOffset, 0);
+  BOLT_CHECK_LE(
+      int64_t{resultOffset} + numRows,
+      std::numeric_limits<vector_size_t>::max());
+  if (resultOffset > 0) {
+    BOLT_CHECK_NOT_NULL(*result);
+    BOLT_CHECK_EQ(result->use_count(), 1);
+    BOLT_CHECK(*(*result)->type() == *type);
+    BOLT_CHECK_LE(resultOffset, (*result)->size());
+    (*result)->resize(resultOffset + numRows);
+  } else if (*result && result->use_count() == 1) {
+    BOLT_CHECK(*(*result)->type() == *type);
+    (*result)->prepareForReuse();
+    (*result)->resize(numRows);
+  } else {
+    *result = BaseVector::create<RowVector>(type, numRows, pool);
+  }
+  if (type->size() == 0) {
+    return;
+  }
+  const auto numColumns = source->read<int32_t>();
+  BOLT_CHECK_EQ(numColumns, type->size(), "Spill column count mismatch");
+  readColumns(
+      source,
+      pool,
+      type->children(),
+      (*result)->children(),
+      resultOffset,
+      useLosslessTimestamp);
+  scatterStructNulls(
+      (*result)->size(), 0, nullptr, nullptr, **result, resultOffset);
+}
 
 void PrestoVectorSerde::estimateSerializedSize(
     VectorPtr vector,
@@ -3817,27 +3962,11 @@ void testingScatterStructNulls(
 
 // static
 void PrestoVectorSerde::registerVectorSerde() {
-  auto toByte = [](int32_t number, int32_t bit) {
-    return static_cast<uint64_t>(bits::isBitSet(&number, bit)) << (bit * 8);
-  };
-  for (auto i = 0; i < 256; ++i) {
-    bitsToBytesMap[i] = toByte(i, 0) | toByte(i, 1) | toByte(i, 2) |
-        toByte(i, 3) | toByte(i, 4) | toByte(i, 5) | toByte(i, 6) |
-        toByte(i, 7);
-  }
   bolt::registerVectorSerde(std::make_unique<PrestoVectorSerde>());
 }
 
 // static
 void PrestoVectorSerde::registerNamedVectorSerde() {
-  auto toByte = [](int32_t number, int32_t bit) {
-    return static_cast<uint64_t>(bits::isBitSet(&number, bit)) << (bit * 8);
-  };
-  for (auto i = 0; i < 256; ++i) {
-    bitsToBytesMap[i] = toByte(i, 0) | toByte(i, 1) | toByte(i, 2) |
-        toByte(i, 3) | toByte(i, 4) | toByte(i, 5) | toByte(i, 6) |
-        toByte(i, 7);
-  }
   bolt::registerNamedVectorSerde(
       VectorSerde::Kind::kPresto, std::make_unique<PrestoVectorSerde>());
 }

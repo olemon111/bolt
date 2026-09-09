@@ -28,6 +28,7 @@
 bolt_add_library(
     bolt_presto_serializer
     PrestoSerializer.cpp
+    SpillSerializer.cpp
     UnsafeRowSerializer.cpp
     CompactRowSerializer.cpp
     ArrowSerializer.cpp

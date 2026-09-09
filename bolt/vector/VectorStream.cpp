@@ -110,6 +110,8 @@ std::string VectorSerde::kindName(Kind kind) {
       return "UnsafeRow";
     case Kind::kArrow:
       return "Arrow";
+    case Kind::kSpill:
+      return "Spill";
   }
   BOLT_UNREACHABLE(
       fmt::format("Unknown vector serde kind: {}", static_cast<int32_t>(kind)));
@@ -121,6 +123,7 @@ VectorSerde::Kind VectorSerde::kindByName(const std::string& kindName) {
       {"CompactRow", Kind::kCompactRow},
       {"UnsafeRow", Kind::kUnsafeRow},
       {"Arrow", Kind::kArrow},
+      {"Spill", Kind::kSpill},
   };
   const auto it = kNameToKind.find(kindName);
   BOLT_CHECK(

@@ -260,11 +260,18 @@ void ByteOutputStream::appendStringView(StringView value) {
 }
 
 void ByteOutputStream::appendStringView(std::string_view value) {
-  const int32_t bytes = value.size();
-  int32_t offset = 0;
+  const int64_t bytes = value.size();
+  int64_t offset = 0;
+  // Preserve allocation sizing for ordinary appends. A single larger input
+  // must be copied in bounded ranges without narrowing its total byte count.
+  // Leave room for newRangeSize() to round an allocation up to a page.
+  const int32_t maxChunk = bytes > std::numeric_limits<int32_t>::max() -
+              memory::AllocationTraits::kPageSize
+      ? 64 * 1024 * 1024
+      : std::numeric_limits<int32_t>::max();
   for (;;) {
     const int32_t bytesFit =
-        std::min(bytes - offset, current_->size - current_->position);
+        std::min<int64_t>(bytes - offset, current_->size - current_->position);
     simd::memcpy(
         current_->buffer + current_->position, value.data() + offset, bytesFit);
     current_->position += bytesFit;
@@ -272,7 +279,7 @@ void ByteOutputStream::appendStringView(std::string_view value) {
     if (offset == bytes) {
       return;
     }
-    extend(bytes - offset);
+    extend(static_cast<int32_t>(std::min<int64_t>(bytes - offset, maxChunk)));
   }
 }
 
@@ -364,7 +371,7 @@ void ByteOutputStream::extend(int32_t bytes) {
 }
 
 int32_t ByteOutputStream::newRangeSize(int32_t bytes) const {
-  const int32_t newSize = allocatedBytes_ + bytes;
+  const int64_t newSize = allocatedBytes_ + bytes;
   if (newSize < 128) {
     return 128;
   }

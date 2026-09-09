@@ -40,13 +40,11 @@
 #include "bolt/common/base/RuntimeMetrics.h"
 #include "bolt/common/file/FileSystems.h"
 #include "bolt/exec/ContainerRow2RowSerde.h"
+#include "bolt/serializers/SpillSerializer.h"
 namespace bytedance::bolt::exec {
 namespace {
-// Spilling currently uses the default PrestoSerializer which by default
-// serializes timestamp with millisecond precision to maintain compatibility
-// with presto. Since bolt's native timestamp implementation supports
-// nanosecond precision, we use this serde option to ensure the serializer
-// preserves precision.
+// Spill must preserve Bolt's native nanosecond timestamp precision, including
+// formats that otherwise default to the precision of their wire protocol.
 static const bool kDefaultUseLosslessTimestamp = true;
 
 constexpr uint64_t kDefaultSpillReadBufferSize =
@@ -383,6 +381,28 @@ uint64_t SpillWriteFile::write(std::string_view buf) {
   return writtenBytes;
 }
 
+namespace {
+VectorSerde* spillSerde(const std::optional<VectorSerde::Kind>& kind) {
+  if (kind == VectorSerde::Kind::kSpill) {
+    return serializer::SpillVectorSerde::get();
+  }
+  return kind ? getNamedVectorSerde(*kind) : nullptr;
+}
+
+std::optional<VectorSerde::Kind> resolveSpillSerde(
+    const std::optional<VectorSerde::Kind>& kind,
+    bool rowBased) {
+  if (rowBased) {
+    return kind;
+  }
+  auto* serde = kind ? spillSerde(kind) : getVectorSerde();
+  // Preserve explicitly selected alternative formats. All Presto columnar
+  // spill, including the default, uses the independent internal page format.
+  return serde->kind() == VectorSerde::Kind::kPresto ? VectorSerde::Kind::kSpill
+                                                     : kind;
+}
+} // namespace
+
 SpillWriter::SpillWriter(
     const RowTypePtr& type,
     const std::vector<SpillSortKey>& sortingKeys,
@@ -406,10 +426,9 @@ SpillWriter::SpillWriter(
       stats_(stats),
       maxBatchRows_(maxBatchRows),
       rowInfo_(rowInfo),
-      spillSerdeKind_(ioConfig.spillSerdeKind) {
-  if (ioConfig.spillSerdeKind) {
-    serde_ = getNamedVectorSerde(*ioConfig.spillSerdeKind);
-  }
+      spillSerdeKind_(
+          resolveSpillSerde(ioConfig.spillSerdeKind, rowInfo_.has_value())) {
+  serde_ = spillSerde(spillSerdeKind_);
 }
 
 SpillWriter::SpillWriter(
@@ -519,7 +538,10 @@ uint64_t SpillWriter::flush() {
   BOLT_CHECK_NOT_NULL(file);
 
   IOBufOutputStream out(
-      *pool_, nullptr, std::max<int64_t>(64 * 1024, batch_->size()));
+      *pool_,
+      nullptr,
+      std::min<int64_t>(
+          64 * 1024 * 1024, std::max<int64_t>(64 * 1024, batch_->size())));
   uint64_t flushTimeUs{0};
   {
     MicrosecondTimer timer(&flushTimeUs);
@@ -954,9 +976,7 @@ SpillReadFileBase::SpillReadFileBase(
       compressionKind_(fileInfo.compressionKind),
       readOptions_{kDefaultUseLosslessTimestamp, compressionKind_},
       serdeKind_(fileInfo.serdeKind),
-      serde_(
-          serdeKind_.has_value() ? getNamedVectorSerde(*serdeKind_) : nullptr) {
-}
+      serde_(spillSerde(serdeKind_)) {}
 
 bool SpillReadFile::nextBatch(RowVectorPtr& rowVector) {
   if (input_->atEnd()) {
